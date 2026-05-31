@@ -1,0 +1,324 @@
+# binctl-tui
+
+Initial design document for binctl-tui.
+
+# Description
+
+This is a TUI frontend for [binctl](https://github.com/clueboard/binctl). From binctl's README:
+
+```
+binctl is a tiny graph-based inventory system for people with too many bins, boxes, and shelves.
+
+Instead of thinking in terms of "SKUs" and "stock levels", binctl models your world as:
+
+    nodes - items, bins, shelves, rooms, etc.
+    edges - "this thing lives inside that thing".
+
+It's backed by a Flask API
+```
+
+The binctl server exposes a forest structure Directed Acyclic Graph (DAG) where each item is guaranteed to have exactly 0 or 1 parents.
+
+This program (binctl-tui) is a [Textualize](https://textual.textualize.io/) frontend for binctl. It renders the tree exposed by binctl and gives the user an easy way to navigate, add new nodes, and maintain existing nodes.
+
+# High Level Architecture
+
+```
+binctl API
+    ^
+    |
+Async Service Layer
+    ^
+    |
+Inventory Cache / DAG Model
+    ^
+    |
+Textual UI
+```
+
+The UI should never directly manipulate API objects.
+
+The cache should own:
+
+- node lookup
+- parent lookup
+- child lookup
+- path generation
+- search indexes
+
+Maintain state about the UI, such as the expansion state of Containers, separately from the widget tree. This will allow you to refresh the DAG without jarring UI changes.
+
+Incomplete list of state that needs to be kept:
+- DAG
+- Expansion state of Containers
+- Flattened search index
+  - All nodes from the DAG normalized to path name (`Home -> Office -> Bookshelf 1 -> USB A Cables`) and stored in a flat structure.
+
+In terms of scale, plan for installations of 1000-10,000 nodes. At this scale architecture matters but we should still be able to have a snappy UI by planning things appropriately and pre-populating datastructures.
+
+# Development
+
+This project will use modern python tools and features. Astral's tools (uv, ruff, ty) should be preferred, and we will use Python 3.13+ and target support for free-threaded Python. Use [blanket](https://pypi.org/project/blanket/) to write deterministic tests when encountering race conditions. Do not attempt to exhaustively identify race conditions for now, simply write tests for them when found.
+
+Network requests should never block the main thread, we want the UI to remain responsive. 
+
+You can find the openapi generated binctl client in <../binctl/binctl_client>. It should be installed to the local venv as "editable" (IE, `pip install -e ../binctl/binctl_client`.)
+
+## Thread Safety
+
+Since we are targeting free-threaded Python (GIL-free) and using Blanket for deterministic race-condition testing, you must be careful with UI state mutations. 
+
+Thread-Safe Data Layer: While your networking won't block the main thread thanks to asyncio, intensive graph operations could run into race conditions if they mutate the same local inventory cache that the TUI reads from.
+
+The Textual Rule: Textual's widget tree and reactive properties are not thread-safe for direct manipulation from arbitrary OS threads. Always ensure that any background data processing hands data back to the main thread via self.call_from_thread() or by passing thread-safe queues back into the asyncio event loop.
+
+Quitting in this environment will be tricky to get right. We will need to raise a sentinel and then wait for `active_operations` to decrement to 0. This should have a timeout so the user is not hung forever, maybe with a dialog box "wait" / "exit now".
+
+## API
+
+Access to the API itself is handled by binctl_client, but there are important semantics to the API to understand.
+
+When fetching nodes you will need to handle pagination, the binctl_client does not do that for you.
+
+Data validation is done by the client, so illegal operations (EG, removing is_container from a node that has children, creating circular parent loops) will result in 4xx errors. Allow the server to do this validation and show an error modal when it happens. When the error modal is dismissed whatever modal they were working in should remain, so they can correct the problem.
+
+## Moving Items
+
+When a user moves a container/item, we need to refresh the DAG from the server. To do this, submit the move to the API, note the id of the item that is currently selected, refresh the DAG from the server, and then reapply expansion state and move the user's cursor to the item that we moved, expanding ancestor Containers as necessary.
+
+The modal should only show Containers, not Items. Once a Container is selected perform the move immediately without confirmation.
+
+The backend will prevent circular loops, you can simply submit the move and let the backend validate.
+
+## Deleting Items
+
+Items are simple to delete and requre only a confirmation modal. (No / Yes)
+
+## Deleting Containers
+
+When Containers are deleted the server will automatically move the items inside to an orphan container. The API exposes this location, you should ask the user where to move child items to and use the orphan container as the default. Use the Container Picker modal to pick the new parent container.
+
+The backend will handle moving the entire tree, only the immediate children need to be addressed.
+
+## First Run Behavior
+
+When first run the program will not have a configuration and will not know what server to talk to. It should start by presenting the Config modal so the user can configure their instance.
+
+# UI Components
+
+The main UI consists of a screen with 3 panes. The bottom 4 lines of the window are the Textual.Footer pane, and it extends the entire width of the screen. The top is split into a 25% / 75% divide, with the 25% consisting of a list of containers returned by the backend. The remainder is split in half, with the left half displaying metadata about the selected container and the right half displaying the description of that item.
+
+The wireframes below are represenative of the desired layout, but are not pixel perfect representations. They should be translated into standard Textual widgets.
+
+## Left Pane
+
+The left pane of Containers (Textual.Tree) always has focus. Hot keys operate on whatever item in that pane is currently selected. Even when hidden, the pane has focus and can be navigated through. Because of this, we must never set `display = False` or `visibility = "hidden"`. 
+
+```
+/* In your TCSS file */
+#sidebar {
+    width: 25%;
+    transition: width 150ms; /* Adds a smooth slide effect */
+}
+
+#sidebar.hidden {
+    width: 0;
+    border: none;
+    padding: 0;
+    margin: 0;
+    overflow: hidden hidden;
+}
+```
+
+## Modals
+
+Modals for certain operations will need to be created. We will likely want to create a custom class for this to make modals easier and more consistent. Modals are the sole exception to the Containers pane always having focus.
+
+The mocked modals below are all normalized to the same width, but the ultimate size of modals should grow and shrink as neccesary to display information.
+
+Modals should generally be dismissed with Esc or Enter. When Esc is pressed the modal should take no action, and when Enter is pressed either the modal should be submitted or the cursor moved to the next field.
+
+## Searching
+
+When the user hits `/`, a modal should pop up with a search box and a place for results. The results should show a path-style name for the items, IE `Home / Office / Bookshelf 2 / USB Micro Cable / 1m USB Micro Cable`. When the user selects a search result, the left pane should move to that selection, expanding parent Containers as necessary.
+
+The search should be case-insensitive substring matching, no fuzzy matching.
+
+## Toggle Container
+
+When the user presses Space the currently selected Container should either expand or collapse. If an item is selected this is a no-op.
+
+## Keyboard Navigation
+
+The following keyboard commands work when the main screen is visible. When a modal is being shown these keys are (generally) not active.
+
+| Key | Action | Available in Modal | Comments |
+| :--- | :--- | :--- | :--- |
+| N | New Node | No | |
+| M | Move Node | No | |
+| E | Edit Node | No | |
+| D | Delete Node | No | |
+| / | Search | No | |
+| Space | Toggle Container | No | |
+| ~ | Hide Sidebar | No | |
+| \` | Hide Sidebar | No | |
+| Q | Quit | No | |
+| ^C | Quit | Yes | |
+| F1 | Help | Yes | Keep this simple for now. We'll enhance in a future iteration |
+| F2 | Config | Yes | If a modal is open, this should first dismiss the modal, which may lose work |
+| F5 | Refresh | No | |
+| Enter | Select / Submit | No | When a modal is open this reverts to the currently focused widget |
+| Up / Down | Cursor Navigation | No | When a modal is open this reverts to the currently focused widget |
+| Page Up / Page Down | Description scrolling | No | Scrolls the description field up and down |
+
+## Screen and Modal Mockups
+
+This section consists of UI mockups showing how we want screens or modals to display. The main screen covers the entire display, 
+
+### Main Screen
+
+```
+┌───────Textual.Static──┐┌──────────────────────────Textual.Static────────────────────────┐
+│ ⌛   Containers       ││{Container,Item}: <Title of Container or Item>                  │
+├─────Textual.Tree──────┤├Textual.ListView(focusable=0)┬───────Textual.Markdown───────────┤
+│▼ Home                 ││ Label: Item Name            │ Description of item              │
+│  ► Bedroom            ││ Created: 2026 Apr 20 17:34  │                                  │
+│  ► Kitchen            ││ Modified: 2026 Apr 23 16:22 │                                  │
+│  ► Living Room        ││ Tags:                       │                                  │
+│  ▼ Office             ││ • Tools                     │                                  │
+│    ► Bookshelf 1      ││ • Automotive                │                                  │
+│    ▼ Bookshelf 2      ││                             │                                  │
+│      ► USB A->C Cables││                             │                                  │
+│      ► USB C<->C Cable││                             │                                  │
+│      ► USB Mini Cables││                             │                                  │
+│      ▼ USB Micro Cable││                             │                                  │
+│        1m USB Micro Ca││                             │                                  │
+│        1.5m USB Micro ││                             │                                  │
+│        2m USB Micro Ca││                             │                                  │
+│▼ Storage Locker       ││                             │                                  │
+└───────────────────────┘└─────────────────────────────┴──────────────────────────────────┘
+┌─────────────────────────────────────────Textual.Static──────────────────────────────────┐
+│ [N]ew [M]ove [E]dit [D]elete [/]Search [Space]Toggle Container [~]Hide Sidebar [Q]uit   │
+│ [F1]Help [F2]Config [F5]Refresh                          <https://binctl.clueboard.co/> │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The hourglass (⌛) is a placeholder for textual's LoadingIndicator. It should be shown when something is actively doing work. Have an atomic counter called `active_operations` that is incremented when work is started and decremented when work completes. Then bind its visibility to `active_operations > 0` via a reactive.
+
+The UI shows ~ for hiding the sidebar, but both `\`` and `~` should behave in the same way.
+
+### Container/Item Picker Modal
+
+```
+┌────────────────────────────────────────────────────┐
+│                {Move,Search}                       │
+├────────────────Textual.Input───────────────────────┤
+│ ►                                                  │
+├────────────────Textual.OptionList──────────────────┤
+├─►Home                                              │
+├─►Home─►Bedroom                                     │
+├─►Home─►Bedroom─►Dresser                            │
+├─►Home─►Kitchen                                     │
+├─►Home─►Kitchen─►Refrigerator                       │
+├─►Home─►Kitchen─►Cabinet                            │
+├─►Home─►Living Room                                 │
+├─►Home─►Living Room─►Closet                         │
+├─►Home─►Office                                      │
+├─►Home─►Office─►Bookshelf 1                         │
+├─►Home─►Office─►Bookshelf 1─►Tools                  │
+├─►Home─►Office─►Bookshelf 1─►THT Parts              │
+└────────────────────────────────────────────────────┘
+```
+
+This modal is used for two features-
+- [M]ove
+- [/]Search
+
+From the user's point of view, these are basically the same, only the title of the modal and the items in the list differ.
+
+At any time the user can arrow down to one of the filtered items and press enter to dismiss the modal and go straight to the item. In a standard TUI layout, if focus is locked inside the Input field, pressing the down arrow key will do nothing—the user would awkwardly have to hit Tab to shift focus into the results list before they could navigate it.
+
+To make it feel fluid (type → immediately arrow down → hit Enter), you can intercept key events at the Modal level. If the user presses Down, you programmatically pass that action straight down to the OptionList without dropping focus from the input field.
+
+When formatting your lineage strings for the OptionList, pass a Textual Rich text object or use inline markup tags to dim the parent nodes and brightly highlight the matching search keyword.
+
+### New/Edit Container/Item Modal
+
+```
+┌────────────────────────────────────────────────────┐
+│Name: ►                                             │
+├────────────────────────────────────────────────────┤
+│☐ Is Container                                      │
+├────────────────────────────────────────────────────┤
+│Parent: Home─►Office─►Bookshelf 1                   │
+├────────────────────────────────────────────────────┤
+│Tags: tag1,tag2,tag3                                │
+├────────────────────────────────────────────────────┤
+│Description:                                        │
+│Description value here. This box grows as needed,   │
+│and becomes scrollable when max size is reached.    │
+├────────────────────────────────────────────────────┤
+│┌─────────┐                               ┌────────┐│
+││ Cancel  │                               │ Submit ││
+│└─────────┘                               └────────┘│
+└────────────────────────────────────────────────────┘
+```
+
+This modal needs the ability to unassign the Parent, to create new Root Containers. To do this the first entry in the container picker should read `<No Parent>` and map to the value `None`.
+
+Parent should default to whatever container is selected in the left hand pane. If an item is selected the parent of the item should be used instead. If the user changes the parent field, the Container/Item Picker Modal should be used to select the new parent.
+
+Edit should pre-populate the fields with the current values.
+
+Treat tags as a raw comma separated list in the UI for now. We will improve that editing in a future version. The backend stores tags as first class API objects, so some implementation work will be needed to be to correctly compose and decompose this list, creating new tags as necessary.
+
+### Confirmation Modal
+
+```
+┌────────────────────────────────────────────────────┐
+│ <Confirmation Message>                             │
+├────────────────────────────────────────────────────┤
+│┌─────────┐                               ┌────────┐│
+││ Cancel  │                               │ Ok     ││
+│└─────────┘                               └────────┘│
+└────────────────────────────────────────────────────┘
+```
+
+Used whenever an action needs to be confirmed. The Cancel (or negative) option should always be on the left. The Ok (or affirmative) option should always be on the right. The default action should be the negative side, but the modal should be able to be instantiated with the affirmative as the default.
+
+The top portion of the modal should grow to show the entire message.
+
+### Message Modal
+
+```
+┌────────────────────────────────────────────────────┐
+│ <Message>                                          │
+├────────────────────────────────────────────────────┤
+│                                          ┌────────┐│
+│                                          │ Ok     ││
+│                                          └────────┘│
+└────────────────────────────────────────────────────┘
+```
+
+Used whenever a message needs to be displayed but no action or choice is available.
+
+The top portion of the modal should grow to show the entire message.
+
+### Configuration
+
+The configuration modal is just a list of text input boxes with OK at the end, sized approprately to the inputs. The necessary boxes:
+
+- binctl URL
+- Token
+- Username
+- Password
+
+When Token is provided, Username and Password should be disabled, and `*disabled*` should be displayed instead of the set value. The set value, if any, should be retained in case the user removes the Token.
+
+Configuration should be stored in `~/.config` or whatever the OS appropriate location is. If textual has a standard config support, use that. If necessary, use `platformdirs` to find the correct config location. We are only supporting a single configuration in V1, but the config file should plan to support multiple configurations in the future. The current configuration should be stored as `default` for now.
+
+After an update the DAG should be reloaded. This will surface standard error messages if the user has misconfigured anything.
+
+### Help
+
+This should be a `Screen.push()` that covers the entire screen and display a Markdown help file. Leave the contents as a placeholder for now.
