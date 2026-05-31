@@ -6,9 +6,9 @@
 binctl_tui/
     __init__.py
     app.py                  # BinctlApp entry point
-    config.py               # Config dataclass + ConfigManager
-    cache.py                # InventoryCache + Node model
-    service.py              # InventoryService (async API wrapper)
+    config.py               # load_config() / save_config()
+    nodes.py                # Pure functions over the node dict
+    service.py              # Async API functions
     screens/
         __init__.py
         main.py             # MainScreen
@@ -35,94 +35,75 @@ Add `pyproject.toml` dependencies: `textual`, `platformdirs`. Install `binctl-cl
 
 ---
 
-## Layer 1: Configuration (`config.py`)
+## Configuration (`config.py`)
 
-### `Config` (dataclass)
-Fields: `url: str`, `token: str | None`, `username: str | None`, `password: str | None`.
+Config is a plain dict with keys: `url`, `token`, `username`, `password`. All values are strings or `None`.
 
-### `ConfigManager`
-- Use `platformdirs.user_config_dir("binctl-tui")` to find the config directory.
-- Persist as TOML. Structure the file to support multiple named profiles in the future: `[profiles.default]` holds the current config. Only implement the `default` profile now.
-- Methods:
-  - `load() -> Config` — reads from disk, returns defaults if file is absent.
-  - `save(config: Config)` — writes the `default` profile to disk.
+Two module-level functions:
+- `load_config() -> dict` — reads from disk using `platformdirs.user_config_dir("binctl-tui")`. Persists as TOML structured as `[profiles.default]` to support multiple profiles in the future. Returns a dict with all keys present (defaulting absent keys to `None`).
+- `save_config(config: dict)` — writes the `default` profile to disk.
 
 ---
 
-## Layer 2: Data Model (`cache.py`)
+## Node Data (`nodes.py`)
 
-### `Node` (dataclass)
-Fields mirroring the binctl API: `id: str`, `name: str`, `is_container: bool`, `description: str`, `tags: list[str]`, `parent_id: str | None`, `created_at: datetime`, `updated_at: datetime`.
+The app holds all nodes in memory as `app.nodes: dict[str, dict]`, where each value is a plain dict with keys matching the API fields: `id`, `label`, `is_container`, `description`, `parent_id`, `tags`, `created_at`, `updated_at`. `description` and `parent_id` are `str | None`. `tags` is `list[tuple[str, str]]` (id, name pairs).
 
-### `InventoryCache`
-The single source of truth for the UI. Holds the full DAG in memory and pre-builds indexes for fast lookup.
+`nodes.py` contains pure functions that take the nodes dict and return results. None of these functions mutate state.
 
-Internal structures:
-- `_nodes: dict[str, Node]` — all nodes by ID
-- `_children: dict[str, list[str]]` — parent_id → list of child IDs
-- `_search_index: list[tuple[str, str]]` — list of `(node_id, "Home / Office / Bookshelf")` path strings, pre-built for search
-
-Methods:
-- `rebuild(nodes: list[Node])` — replace all internal state atomically from a fresh list of nodes. This also rebuilds `_children` and `_search_index`.
-- `get_node(id: str) -> Node | None`
-- `get_children(id: str) -> list[Node]` — sorted by name
-- `get_roots() -> list[Node]` — nodes with no parent, sorted by name
-- `get_path(id: str) -> list[Node]` — ordered ancestor list from root to node
-- `get_path_string(id: str) -> str` — `"Home / Office / Bookshelf"`
-- `search(query: str, containers_only: bool = False) -> list[tuple[str, str]]` — case-insensitive substring match against path strings; returns matching `(node_id, path_string)` pairs
-
-`rebuild()` is the only mutating method. Call it on the main thread (or via `call_from_thread`) after a full DAG fetch.
+Functions:
+- `get_children(nodes, parent_id) -> list[dict]` — sorted by label
+- `get_roots(nodes) -> list[dict]` — nodes where `parent_id` is `None`, sorted by label
+- `get_path(nodes, node_id) -> list[dict]` — ordered ancestor list from root to node
+- `get_path_string(nodes, node_id) -> str` — `"Home / Office / Bookshelf"`
+- `search(nodes, query, containers_only=False) -> list[tuple[str, str]]` — case-insensitive substring match against path strings; returns `(node_id, path_string)` pairs
 
 ---
 
-## Layer 3: Service Layer (`service.py`)
+## Service Layer (`service.py`)
 
-### `InventoryService`
-Wraps the binctl-client. Takes a reference to `BinctlApp` so it can increment/decrement `app.active_operations` and call `app.call_from_thread` when needed.
+Module-level async functions that wrap the binctl-client. Each function increments `app.active_operations` on entry and decrements it in a `finally` block.
 
-All public methods are `async`. Each one:
-1. Increments `app.active_operations`.
-2. Performs the API call(s).
-3. Decrements `app.active_operations` in a `finally` block.
+The binctl-client returns `attrs` objects with `Unset` sentinel values on optional fields. All service functions normalize these at the boundary before returning: `Unset` becomes `None`. The rest of the app never sees `Unset`. The client's `Node` and `NodeChild` types are both normalized into the same plain dict shape.
 
-Methods:
-- `fetch_token(username: str, password: str) -> str` — requests and returns a bearer token; stores it only in memory.
-- `fetch_all_nodes() -> list[Node]` — fetches all pages from the API and returns a flat node list. Uses the binctl-client's node list endpoint, handling `next_cursor` pagination manually.
-- `get_orphan_location() -> str | None` — fetches server config to get the orphan container ID.
-- `create_node(name, is_container, parent_id, tags, description) -> Node`
-- `update_node(id, **fields) -> Node`
-- `delete_node(id: str)`
-- `move_node(id: str, new_parent_id: str | None)`
+Functions:
+- `fetch_token(app, username, password) -> str` — returns a bearer token, stored in memory only
+- `fetch_all_nodes(app) -> dict[str, dict]` — fetches all pages (handling pagination manually), normalizes each node, returns the full `nodes` dict ready to assign to `app.nodes`
+- `get_orphan_location(app) -> str | None`
+- `create_node(app, label, is_container, parent_id, tags, description) -> dict`
+- `update_node(app, node_id, **fields) -> dict`
+- `delete_node(app, node_id)`
+- `move_node(app, node_id, new_parent_id)`
 
-On 4xx responses, raise a typed exception (e.g., `APIError(message: str)`) that the UI catches and shows via `MessageModal`.
+Tags: `create_node` and `update_node` receive tags as a list of name strings. The service layer resolves these against the API — fetching existing tags by name, creating new ones as needed — and submits the correct tag IDs.
+
+On 4xx responses, raise `APIError(message)`. The UI catches this and shows a `MessageModal`, keeping the originating modal open.
 
 ---
 
-## Layer 4: Application (`app.py`)
+## Application (`app.py`)
 
 ### `BinctlApp(App)`
 
 Reactives:
-- `active_operations: int = 0` — atomic counter. Bind the loading indicator's visibility to `active_operations > 0`.
+- `active_operations: int = 0` — bind the loading indicator's visibility to `active_operations > 0`
 - `selected_node_id: str | None = None`
 
-Non-reactive state:
-- `inventory_cache: InventoryCache`
-- `inventory_service: InventoryService`
-- `config: Config`
-- `expansion_state: dict[str, bool]` — persists tree expand/collapse state across DAG refreshes. Keyed by node ID.
+Plain state:
+- `nodes: dict[str, dict]` — the full node set, replaced wholesale on each fetch
+- `config: dict` — current config, loaded from disk on startup
+- `expansion_state: dict[str, bool]` — tree expand/collapse state, keyed by node ID, persisted across node refreshes
 - `_quitting: bool = False`
 
 Lifecycle:
-- `on_mount()`: load config → if no URL configured, push `ConfigModal` → else proceed to `startup_flow()`.
-- `startup_flow()`: if token provided use it; else call `fetch_token()`; verify by calling `get_orphan_location()`; if any error, push a `ConfirmModal`-style dialog offering "Exit" / "Configuration" as the two choices. On success, call `load_dag()`.
-- `load_dag()`: calls `service.fetch_all_nodes()`, then `cache.rebuild(nodes)`, then posts `DagLoaded` message to update the tree.
-- `refresh_dag(focus_id: str | None = None)`: same as `load_dag()` but after rebuild, restores `expansion_state` and calls `main_screen.tree.navigate_to(focus_id)` if provided.
+- `on_mount()`: call `load_config()` → if `config['url']` is absent, push `ConfigModal` → else call `startup_flow()`
+- `startup_flow()`: use token if present, else call `fetch_token()`; verify by calling `get_orphan_location()`; on any error push a two-button dialog offering "Exit" / "Configuration". On success call `load_nodes()`.
+- `load_nodes()`: calls `fetch_all_nodes()`, assigns result to `app.nodes`, posts `NodesLoaded` message.
+- `refresh_nodes(focus_id=None)`: same as `load_nodes()` but after assignment, restores `expansion_state` and navigates to `focus_id` if provided.
 
-Quit flow:
-- On `Q` or app close: set `_quitting = True`. If `active_operations == 0`, exit. Otherwise push a modal offering "Wait" / "Exit Now". If wait is chosen, watch `active_operations` and exit when it hits 0 (with a hard timeout of ~10 seconds, after which show a second "still waiting / force exit" prompt).
+Quit flow: set `_quitting = True`. Once `active_operations == 0`, exit immediately. Wait for a timeout (5 seconds) then push a modal with "Wait" / "Exit Now". If waiting, exit when `active_operations` hits 0. Hard timeout of ~10 seconds, then prompt "Still busy. Force exit?".
 
-Key bindings defined on the App (active when no modal is focused):
+Key bindings (active when no modal is focused):
 - `N` → `action_new_node()`
 - `M` → `action_move_node()`
 - `E` → `action_edit_node()`
@@ -133,14 +114,14 @@ Key bindings defined on the App (active when no modal is focused):
 - `Q` → `action_quit()`
 - `F1` → `push_screen(HelpScreen())`
 - `F2` → `action_open_config()` (dismiss open modal first if any)
-- `F5` → `refresh_dag()`
+- `F5` → `refresh_nodes()`
 
 ### `main` entry point
-Load config, instantiate `BinctlApp`, call `app.run()`.
+Instantiate `BinctlApp` and call `app.run()`.
 
 ---
 
-## Layer 5: Screens
+## Screens
 
 ### `MainScreen(Screen)` (`screens/main.py`)
 
@@ -155,189 +136,139 @@ Composed of:
 - `NodeMetadataPane` in top-right.
 - `NodeDescriptionPane` in bottom-right.
 
-Sidebar hide/show: controlled by toggling a `.hidden` CSS class on `#sidebar`. Never use `display = False`. See design doc for the CSS using `width: 0` and `overflow: hidden hidden`.
+Sidebar hide/show: toggle a `.hidden` CSS class on `#sidebar`. Never use `display = False`. See design doc for the CSS using `width: 0` and `overflow: hidden hidden`.
 
 The `ContainerTree` always retains focus, even when the sidebar is visually hidden.
 
 ### `HelpScreen(Screen)` (`screens/help.py`)
 
-Full-screen push. Contains a `Markdown` widget rendering `help.md`. Dismiss with `Esc` or `Q`. No other interaction.
+Full-screen push. Contains a `Markdown` widget rendering `help.md`. Dismiss with `Esc` or `Q`.
 
 ---
 
-## Layer 6: Widgets
+## Widgets
 
 ### `ContainerTree(Tree)` (`widgets/container_tree.py`)
 
-Subclass of `Textual.Tree`. Responsible for all tree rendering and navigation.
-
 Methods:
-- `rebuild(cache: InventoryCache, expansion_state: dict[str, bool])` — clears and repopulates the tree from the cache. Each `TreeNode`'s `data` attribute holds the node's ID string. Applies expansion state, expanding nodes that were previously expanded.
-- `navigate_to(node_id: str)` — walks the ancestor path, expands each ancestor (updating `app.expansion_state`), scrolls the tree, and sets focus/cursor to the target node.
-- `get_selected_node_id() -> str | None` — returns the node ID of the currently highlighted tree node.
+- `rebuild(nodes, expansion_state)` — clears and repopulates the tree. Each `TreeNode.data` holds the node's ID string. Applies expansion state.
+- `navigate_to(node_id)` — expands ancestors, scrolls, and moves cursor to the target node, updating `app.expansion_state` along the way.
+- `get_selected_node_id() -> str | None`
 
-On cursor move, post a message `NodeSelected(node_id: str)` that `MainScreen` handles to update the metadata and description panes, and to trigger a node detail fetch.
+On cursor move, posts `NodeSelected(node_id)` for `MainScreen` to handle.
 
-Node labels: show a `►` (collapsed) or `▼` (expanded) prefix for containers. Items have no prefix glyph (or a simple space indent for alignment).
+On `on_tree_node_expanded` / `on_tree_node_collapsed`, updates `app.expansion_state[node_id]`.
 
-On `on_tree_node_expanded` / `on_tree_node_collapsed`, update `app.expansion_state[node_id]`.
+Node labels: `►` / `▼` prefix for containers, plain label for items.
 
 ### `NodeMetadataPane(Widget)` (`widgets/node_metadata.py`)
 
-A non-focusable display widget. Renders: Label, Created, Modified, Tags as a formatted list. Updates reactively when the selected node changes.
+Non-focusable. Renders label, created, modified, and tags for the selected node. Updates when `selected_node_id` changes.
 
 ### `NodeDescriptionPane(Markdown)` (`widgets/node_description.py`)
 
-A scrollable `Markdown` widget. `Page Up` / `Page Down` scroll it. Updates when the selected node changes.
+Scrollable `Markdown` widget. `Page Up` / `Page Down` scroll it. Updates when `selected_node_id` changes.
 
 ---
 
-## Layer 7: Modals
+## Modals
 
 ### `BaseModal(ModalScreen)` (`modals/base.py`)
 
-Base class for all modals. Sets a consistent width. Dismisses on `Esc` with `None` as the result. Does not dismiss on `Enter` by default (subclasses handle that).
+Consistent width. Dismisses on `Esc` with `None`.
 
 ### `PickerModal(BaseModal)` (`modals/picker.py`)
 
-Used for both **Search** (`/`) and **Move** (`M`). Constructor params: `title: str`, `items: list[tuple[str, str]]` (node_id, path_string pairs), `filter_to_containers: bool = False`.
+Used for **Search** (`/`) and **Move** (`M`). Params: `title`, `items` (list of `(node_id, path_string)` tuples), `filter_to_containers`.
 
-Layout:
-- `Input` at top (always focused).
-- `OptionList` below showing filtered path strings.
-
-Behavior:
-- Typing in `Input` filters the `OptionList` via case-insensitive substring match.
-- `Down` arrow key is intercepted at the modal level: do not move focus; instead programmatically scroll/highlight the next item in `OptionList`.
-- `Enter` dismisses with the highlighted `node_id`, or `None` if nothing is highlighted.
-- `Esc` dismisses with `None`.
-
-Formatting: use Textual Rich markup to dim ancestor path segments and brightly highlight the substring that matched the query.
+- `Input` at top, always focused.
+- `OptionList` below, filtered as the user types.
+- `Down` arrow intercepted at modal level: highlights next `OptionList` item without moving focus from `Input`.
+- `Enter` dismisses with highlighted node ID. `Esc` dismisses with `None`.
+- Rich markup: dim ancestor segments, highlight matching substring.
 
 ### `NodeEditModal(BaseModal)` (`modals/node_edit.py`)
 
-Used for both **New** (`N`) and **Edit** (`E`). Constructor params: `node: Node | None`, `default_parent_id: str | None`.
+Used for **New** (`N`) and **Edit** (`E`). Params: `node` (dict or `None`), `default_parent_id`.
 
-Fields (in order):
-1. `Input` — Name
-2. `Switch` / `Checkbox` — Is Container
-3. Parent display (read-only `Static` showing path string + a `Button` to change it). Clicking the button pushes `PickerModal(containers_only=True)` and updates the field on return. First entry in the picker list is `<No Parent>` mapping to `None`.
-4. `Input` — Tags (comma-separated raw string)
-5. `TextArea` — Description (grows to a max height, then scrolls)
-6. Cancel (left) / Submit (right) buttons
+Fields: Name (`Input`), Is Container (`Switch`), Parent (read-only display + button that opens `PickerModal`), Tags (`Input`, comma-separated), Description (`TextArea`), Cancel / Submit buttons.
 
-Pre-populate all fields from `node` when editing. Default Parent to `default_parent_id` when creating.
+First entry in the parent picker is `<No Parent>` → `None`.
 
-On Submit:
-- Compose API call (`create_node` or `update_node`).
-- If `APIError` is raised, push `MessageModal(error.message)` and keep this modal open.
-- On success, dismiss with the returned `Node`.
-
-Tags: split on commas to build a list for the API. The service layer handles creating new tag objects as needed.
+On Submit: call `create_node` or `update_node`. On `APIError`, push `MessageModal` and keep this modal open. On success, dismiss with the returned node dict.
 
 ### `ConfirmModal(BaseModal)` (`modals/confirm.py`)
 
-Constructor params: `message: str`, `affirmative_default: bool = False`.
-
-Layout:
-- `Static` message area (auto-height).
-- Cancel button (left) / Ok button (right).
-
-Default focus is on Cancel unless `affirmative_default=True`. `Enter` activates the focused button. Dismisses with `True` (Ok) or `False` (Cancel/Esc).
+Params: `message`, `affirmative_default=False`. Auto-height message area. Cancel (left) / Ok (right). Dismisses with `True` or `False`.
 
 ### `MessageModal(BaseModal)` (`modals/message.py`)
 
-Constructor param: `message: str`.
-
-Layout:
-- `Static` message area (auto-height).
-- Ok button (right only).
-
-Dismisses with `None` on Ok or Esc.
+Param: `message`. Auto-height message area. Ok button (right). Dismisses with `None`.
 
 ### `ConfigModal(BaseModal)` (`modals/config.py`)
 
-Fields:
-- `Input` — binctl URL
-- `Input` (password mode) — Token
-- `Input` — Username
-- `Input` (password mode) — Password
-- Ok button
-
-When Token has a value, Username and Password inputs are disabled and display `*disabled*` as placeholder text. The actual stored values are preserved; they are re-enabled if Token is cleared.
-
-Pre-populate from current `Config`. On Ok: save via `ConfigManager`, update `app.config`, trigger `app.refresh_dag()`.
+Fields: URL, Token, Username, Password. When Token is non-empty, Username and Password are disabled and show `*disabled*` as placeholder (stored values are preserved). Pre-populated from `app.config`. On Ok: call `save_config()`, update `app.config`, call `app.refresh_nodes()`.
 
 ---
 
 ## Key Flows
 
 ### Startup
-1. `BinctlApp.on_mount()` loads config from disk.
-2. If URL is empty, push `ConfigModal`.
-3. Otherwise call `startup_flow()`:
-   - If token present, use it. Else call `service.fetch_token(username, password)`, store in memory only.
-   - Call `service.get_orphan_location()` to validate the token.
-   - On any error, push a two-button dialog: "Exit" dismisses the app, "Configuration" pushes `ConfigModal`.
-4. Call `load_dag()`.
+1. `on_mount()` calls `load_config()`.
+2. If no URL, push `ConfigModal`.
+3. Otherwise `startup_flow()`: authenticate, verify via `get_orphan_location()`, on error show Exit/Configuration dialog, on success call `load_nodes()`.
 
-### DAG Refresh
-1. Call `service.fetch_all_nodes()` (async, increments `active_operations`).
-2. On completion: `cache.rebuild(nodes)`.
-3. Post `DagLoaded` message (or call `call_from_thread`).
-4. `MainScreen` handles `DagLoaded`: calls `tree.rebuild(cache, expansion_state)`.
-5. If a `focus_id` was provided, call `tree.navigate_to(focus_id)`.
+### Node Refresh
+1. `fetch_all_nodes()` returns a fresh `dict[str, dict]`.
+2. Assign to `app.nodes`.
+3. Post `NodesLoaded` message.
+4. `MainScreen` handles `NodesLoaded`: calls `tree.rebuild(app.nodes, app.expansion_state)`.
+5. If `focus_id` provided, call `tree.navigate_to(focus_id)`.
 
 ### Move Node
-1. Push `PickerModal(title="Move", items=containers_only_paths)`.
-2. On result (new parent ID or None for no parent): call `service.move_node(selected_id, new_parent_id)`.
-3. Call `refresh_dag(focus_id=moved_node_id)`.
+1. Push `PickerModal` (containers only), built from `nodes.search(app.nodes, "", containers_only=True)`.
+2. On result: call `move_node()`, then `refresh_nodes(focus_id=moved_node_id)`.
 
 ### Search
-1. Push `PickerModal(title="Search", items=all_node_paths)`.
-2. On result (selected node ID): call `tree.navigate_to(node_id)`.
+1. Push `PickerModal` (all nodes).
+2. On result: call `tree.navigate_to(node_id)`.
 
 ### Delete Item
-1. Push `ConfirmModal("Delete '<name>'? This cannot be undone.")`.
-2. On `True`: call `service.delete_node(id)`, then `refresh_dag()`.
+1. Push `ConfirmModal`.
+2. On `True`: call `delete_node()`, then `refresh_nodes()`.
 
 ### Delete Container
-1. Fetch orphan location name from cache (or service).
-2. Push `ConfirmModal("Delete '<name>'? Children will be moved to '<orphan_location>' (or root if none).")`.
-3. On `True`: call `service.delete_node(id)`, then `refresh_dag()`.
+1. Push `ConfirmModal` with orphan location note.
+2. On `True`: call `delete_node()`, then `refresh_nodes()`.
 
 ### Quit
-1. Set `app._quitting = True`.
-2. If `active_operations == 0`: call `app.exit()`.
-3. Otherwise push a modal with "Wait" and "Exit Now".
-   - "Exit Now": `app.exit()` immediately.
-   - "Wait": watch `active_operations`; exit when 0. If not zero after 10 seconds, push "Still busy. Force exit?" prompt.
+1. Set `_quitting = True`.
+2. If `active_operations == 0`: exit.
+3. Otherwise: "Wait" / "Exit Now" modal. On wait, exit when operations drain. Hard timeout ~10s, then force-exit prompt.
 
 ---
 
 ## Thread Safety Notes
 
-- `InventoryCache.rebuild()` must only be called from the main asyncio thread (use `call_from_thread` if called from a background OS thread).
-- Increment/decrement of `active_operations` must be done atomically. Use `app.active_operations += 1` in the asyncio event loop; asyncio is single-threaded so this is safe for async tasks. If ever using `asyncio.to_thread()` for CPU-heavy work, use `call_from_thread` to update `active_operations`.
+- `app.nodes` is replaced atomically (single assignment) from the asyncio event loop — safe since asyncio is single-threaded.
+- If `asyncio.to_thread()` is ever used for CPU-heavy work, hand results back via `call_from_thread()`.
 - Never manipulate Textual widget state from outside the event loop.
-- The `expansion_state` dict is read/written only from the main thread.
+- `app.expansion_state` is read/written only from the main thread.
 
 ---
 
 ## Styles (`styles/main.tcss`)
 
-Key rules to implement:
-- Sidebar hide/show via `.hidden` class: `width: 0`, `overflow: hidden hidden`, `border: none`, `padding/margin: 0`. Normal state: `width: 25%`, `transition: width 150ms`.
-- Loading indicator shown/hidden via reactive binding to `active_operations > 0`.
-- Modal widths: consistent across all modals (e.g., `width: 60`).
-- NodeMetadataPane: non-focusable, no scrollbar.
+- Sidebar: `width: 25%`, `transition: width 150ms`. `.hidden` class: `width: 0`, `overflow: hidden hidden`, `border: none`, `padding: 0`, `margin: 0`.
+- Loading indicator visibility bound to `active_operations > 0`.
+- Consistent modal width across all modals.
+- `NodeMetadataPane`: non-focusable, no scrollbar.
 
 ---
 
 ## Testing Notes
 
-- Use `blanket` for any tests involving async/concurrent behavior once race conditions are discovered.
-- Unit-test `InventoryCache` methods independently with fixture node lists.
-- Unit-test `ConfigManager` load/save with a temp directory.
-- Integration-test `InventoryService` against a mock HTTP server.
-- Do not attempt to exhaustively identify race conditions upfront; write blanket tests when specific races are found.
+- Use `blanket` for async/concurrent tests when specific races are found — do not attempt to identify races exhaustively upfront.
+- Unit-test `nodes.py` functions with fixture dicts.
+- Unit-test `load_config` / `save_config` with a temp directory.
+- Integration-test service functions against a mock HTTP server.
