@@ -96,13 +96,17 @@ Items are simple to delete and requre only a confirmation modal. (No / Yes)
 
 ## Deleting Containers
 
-When Containers are deleted the server will automatically move the items inside to an orphan container. The API exposes this location, you should ask the user where to move child items to and use the orphan container as the default. Use the Container Picker modal to pick the new parent container.
-
-The backend will handle moving the entire tree, only the immediate children need to be addressed.
+When Containers are deleted the server will automatically move the items inside to an orphan container. Only a confirmation modal is needed, with a note about where any orphaned items will move to. If the orphan location is None, the items will be moved to the root (IE, no parent.)
 
 ## First Run Behavior
 
 When first run the program will not have a configuration and will not know what server to talk to. It should start by presenting the Config modal so the user can configure their instance.
+
+## Startup Behavior
+
+Upon startup, if Token is provided, that will be used directly. If Username/Password are provided, a session token will be requested from the API. If there are any errors fetching a bearer token, a dialog should be shown with "Exit" / "Configuration" as the choices. Token is not persisted in this path, it is only stored in memory.
+
+One of the first things we'll need to do is check the config to get the orphan location. That's our opportunity to display the same dialog if the Token is invalid.
 
 # UI Components
 
@@ -167,7 +171,7 @@ The following keyboard commands work when the main screen is visible. When a mod
 | F1 | Help | Yes | Keep this simple for now. We'll enhance in a future iteration |
 | F2 | Config | Yes | If a modal is open, this should first dismiss the modal, which may lose work |
 | F5 | Refresh | No | |
-| Enter | Select / Submit | No | When a modal is open this reverts to the currently focused widget |
+| Enter | Select / Submit | No | When a modal is open this reverts to the currently focused widget rather than the left pane |
 | Up / Down | Cursor Navigation | No | When a modal is open this reverts to the currently focused widget |
 | Page Up / Page Down | Description scrolling | No | Scrolls the description field up and down |
 
@@ -206,6 +210,8 @@ This section consists of UI mockups showing how we want screens or modals to dis
 The hourglass (⌛) is a placeholder for textual's LoadingIndicator. It should be shown when something is actively doing work. Have an atomic counter called `active_operations` that is incremented when work is started and decremented when work completes. Then bind its visibility to `active_operations > 0` via a reactive.
 
 The UI shows ~ for hiding the sidebar, but both `\`` and `~` should behave in the same way.
+
+When nodes are displayed we should load details about them, this includes re-fetching the node object to get updated metadata and tags.
 
 ### Container/Item Picker Modal
 
