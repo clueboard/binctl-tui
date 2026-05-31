@@ -62,7 +62,7 @@ This project will use modern python tools and features. Astral's tools (uv, ruff
 
 Network requests should never block the main thread, we want the UI to remain responsive. 
 
-You can find the openapi generated binctl client in <../binctl/binctl_client>. It should be installed to the local venv as "editable" (IE, `pip install -e ../binctl/binctl_client`.)
+You can find the openapi generated binctl client in <../binctl/binctl-client>. It should be installed to the local venv as "editable" (IE, `pip install -e ../binctl/binctl-client`.)
 
 ## Thread Safety
 
@@ -76,9 +76,9 @@ Quitting in this environment will be tricky to get right. We will need to raise 
 
 ## API
 
-Access to the API itself is handled by binctl_client, but there are important semantics to the API to understand.
+Access to the API itself is handled by binctl-client, but there are important semantics to the API to understand.
 
-When fetching nodes you will need to handle pagination, the binctl_client does not do that for you.
+When fetching nodes you will need to handle pagination, the binctl-client does not do that for you.
 
 Data validation is done by the client, so illegal operations (EG, removing is_container from a node that has children, creating circular parent loops) will result in 4xx errors. Allow the server to do this validation and show an error modal when it happens. When the error modal is dismissed whatever modal they were working in should remain, so they can correct the problem.
 
