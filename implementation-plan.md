@@ -56,7 +56,8 @@ Functions:
 - `get_roots(nodes) -> list[dict]` — nodes where `parent_id` is `None`, sorted by label
 - `get_path(nodes, node_id) -> list[dict]` — ordered ancestor list from root to node
 - `get_path_string(nodes, node_id) -> str` — `"Home / Office / Bookshelf"`
-- `search(nodes, query, containers_only=False) -> list[tuple[str, str]]` — case-insensitive substring match against path strings; returns `(node_id, path_string)` pairs
+- `build_search_index(nodes) -> list[tuple[str, str]]` — computes `(node_id, path_string)` pairs for all nodes; call once after a fetch and store as `app.search_index`
+- `search(index, query, containers_only=False) -> list[tuple[str, str]]` — case-insensitive substring match against the pre-built index; returns matching `(node_id, path_string)` pairs
 
 ---
 
@@ -91,6 +92,7 @@ Reactives:
 
 Plain state:
 - `nodes: dict[str, dict]` — the full node set, replaced wholesale on each fetch
+- `search_index: list[tuple[str, str]]` — pre-built `(node_id, path_string)` pairs, rebuilt after each fetch via `build_search_index()`
 - `config: dict` — current config, loaded from disk on startup
 - `expansion_state: dict[str, bool]` — tree expand/collapse state, keyed by node ID, persisted across node refreshes
 - `_quitting: bool = False`
@@ -98,7 +100,7 @@ Plain state:
 Lifecycle:
 - `on_mount()`: call `load_config()` → if `config['url']` is absent, push `ConfigModal` → else call `startup_flow()`
 - `startup_flow()`: use token if present, else call `fetch_token()`; verify by calling `get_orphan_location()`; on any error push a two-button dialog offering "Exit" / "Configuration". On success call `load_nodes()`.
-- `load_nodes()`: calls `fetch_all_nodes()`, assigns result to `app.nodes`, posts `NodesLoaded` message.
+- `load_nodes()`: calls `fetch_all_nodes()`, assigns result to `app.nodes`, calls `build_search_index()` and stores result as `app.search_index`, posts `NodesLoaded` message.
 - `refresh_nodes(focus_id=None)`: same as `load_nodes()` but after assignment, restores `expansion_state` and navigates to `focus_id` if provided.
 
 Quit flow: set `_quitting = True`. Once `active_operations == 0`, exit immediately. Wait for a timeout (5 seconds) then push a modal with "Wait" / "Exit Now". If waiting, exit when `active_operations` hits 0. Hard timeout of ~10 seconds, then prompt "Still busy. Force exit?".
