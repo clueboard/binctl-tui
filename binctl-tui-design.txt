@@ -62,7 +62,7 @@ This project will use modern python tools and features. Astral's tools (uv, ruff
 
 Network requests should never block the main thread, we want the UI to remain responsive. 
 
-You can find the openapi generated binctl client in <../binctl/binctl-client>. It should be installed to the local venv as "editable" (IE, `pip install -e ../binctl/binctl-client`.)
+You can find the openapi generated binctl client in pypi as binctl-client. 
 
 ## Thread Safety
 
