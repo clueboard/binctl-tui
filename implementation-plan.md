@@ -39,11 +39,7 @@ binctl_tui/
 | User config (URL, credentials) | TOML | `platformdirs.user_config_dir("binctl-tui") / config.toml` |
 
 Config file structure supports multiple named profiles for future use; V1 reads/writes only `[profiles.default]`.
-V1 stores credentials in this TOML file rather than integrating with the OS
-keyring. On POSIX, create and enforce `0700` permissions on the config directory
-and `0600` on `config.toml`. Save atomically so a partial write cannot expose or
-corrupt credentials. Never include credential values in logs, errors, or
-diagnostic output.
+V1 stores credentials in this TOML file rather than integrating with the OS keyring. On POSIX, create and enforce `0700` permissions on the config directory and `0600` on `config.toml`. Save atomically so a partial write cannot expose or corrupt credentials. Never include credential values in logs, errors, or diagnostic output.
 
 No other state is persisted to disk. The DAG, expansion state, and search index are rebuilt from the API on each startup.
 
@@ -77,14 +73,9 @@ No other state is persisted to disk. The DAG, expansion state, and search index 
 
 ## Phase 3: Service Layer (`service.py`)
 
-Wraps binctl-client API functions. All API operations after client construction use
-the generated client's async functions and never block the main thread.
+Wraps binctl-client API functions. All API operations after client construction use the generated client's async functions and never block the main thread.
 
-Authentication during `build_client()` is intentionally synchronous when the user
-provides a username and password: `binctl-client` obtains the bearer token while
-constructing its `Client`. This may briefly block during startup or after a
-configuration change, which is acceptable for V1 and avoids duplicating the
-client's authentication implementation.
+Authentication during `build_client()` is intentionally synchronous when the user provides a username and password: `binctl-client` obtains the bearer token while constructing its `Client`. This may briefly block during startup or after a configuration change, which is acceptable for V1 and avoids duplicating the client's authentication implementation.
 
 - Handles **pagination** for `get_nodes_list` (loop until `offset + len(items) >= total`)
 - Handles **auth**: if token provided use directly; otherwise construct the client with username/password so it synchronously obtains a bearer token; surface errors to caller
@@ -118,9 +109,7 @@ Methods:
 - `get_path_string(id)` → `"Home / Office / Bookshelf 2"`
 - `search(query)` → `list[tuple[str, str]]` — case-insensitive substring, returns (path_string, node_id)
 
-The cache stores only `NodeChild` summaries from `fetch_all_nodes()`; it never
-eagerly fetches full `Node` objects. The search index is pre-built on `build()`
-so search is O(n) scan with no per-query tree traversal.
+The cache stores only `NodeChild` summaries from `fetch_all_nodes()`; it never eagerly fetches full `Node` objects. The search index is pre-built on `build()` so search is O(n) scan with no per-query tree traversal.
 
 ## Phase 5: Main Screen (`screens/main.py`)
 
@@ -158,7 +147,7 @@ Detail widgets:
 | Space     | Toggle Container        | No-op if an item (non-container) is selected                          |
 | ~ or `    | Toggle Sidebar          | Both keys do the same thing                                           |
 | Q         | Quit                    | Graceful: wait for `active_operations == 0`, timeout ~5s              |
-| ^C        | Quit                    | Works even in modals                                                  |
+| ^C        | Quit / Hard Quit         | Works even in modals; graceful first press, unsafe immediate exit during shutdown |
 | F1        | Help                    | Works in modals; push HelpScreen                                      |
 | F2        | Config                  | Works in modals; dismiss current modal first (may lose work)          |
 | F5        | Refresh                 | Re-fetch DAG and tag index from server                                |
@@ -166,7 +155,7 @@ Detail widgets:
 | Up / Down | Cursor Navigation       | In modal: acts on focused widget                                      |
 | PgUp/PgDn | Scroll Description      | Scrolls the description `Markdown` widget                             |
 
-Graceful quit: set a quit sentinel, wait for `active_operations == 0` (or timeout), show ConfirmModal "Wait / Exit Now".
+Graceful quit: set a shutdown sentinel, wait for `active_operations == 0` (or timeout), then show ConfirmModal "Wait / Exit Now". `Q` and the first `^C` initiate this graceful path. A subsequent `^C` while shutdown is in progress immediately terminates the process without waiting for active operations.
 
 ## Phase 7: Modals (`modals/`)
 
