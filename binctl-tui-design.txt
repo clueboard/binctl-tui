@@ -36,7 +36,9 @@ Inventory Cache / DAG Model
 Textual UI
 ```
 
-The UI should never directly manipulate API objects.
+The UI should never call the generated API client directly. It accesses
+node-list summaries through `InventoryCache` and full node details through its
+lazy detail widgets.
 
 The cache should own:
 
@@ -46,6 +48,15 @@ The cache should own:
 - path generation
 - search indexes
 
+The paginated node-list response supplies `NodeChild` summaries, which are the
+only node representation stored in the cache. They provide everything needed
+for navigation: IDs, labels, container state, timestamps, descriptions, and
+parent IDs. The cache must not eagerly fetch full nodes.
+
+Only a selected node's lazy detail widget fetches the full `Node` representation,
+which includes tags and children. This keeps full DAG refreshes lightweight
+while allowing the right pane to display complete metadata.
+
 Maintain state about the UI, such as the expansion state of Containers, separately from the widget tree. This will allow you to refresh the DAG without jarring UI changes.
 
 Incomplete list of state that needs to be kept:
@@ -53,6 +64,7 @@ Incomplete list of state that needs to be kept:
 - Expansion state of Containers
 - Flattened search index
   - All nodes from the DAG normalized to path name (`Home -> Office -> Bookshelf 1 -> USB A Cables`) and stored in a flat structure.
+- Lazy node detail widgets, keyed by node ID and evicted after a last-access TTL.
 
 In terms of scale, plan for installations of 1000-10,000 nodes. At this scale architecture matters but we should still be able to have a snappy UI by planning things appropriately and pre-populating datastructures.
 
@@ -93,6 +105,12 @@ The backend will prevent circular loops, you can simply submit the move and let 
 ## Deleting Items
 
 Items are simple to delete and requre only a confirmation modal. (No / Yes)
+
+Before deletion, capture the selected node's direct previous sibling and parent
+from the cached tree. After the authoritative DAG refresh, select the previous
+sibling if it remains; otherwise select the parent. If deleting the first root,
+select its next root if it remains instead. If no fallback remains, leave the
+tree unselected.
 
 ## Deleting Containers
 
@@ -211,7 +229,17 @@ The hourglass (⌛) is a placeholder for textual's LoadingIndicator. It should b
 
 The UI shows ~ for hiding the sidebar, but both `\`` and `~` should behave in the same way.
 
-When nodes are displayed we should load details about them, this includes re-fetching the node object to get updated metadata and tags.
+Node details are represented by lazy widgets keyed by node ID, rather than by a
+single mutable metadata/description pane. When selection changes, hide the
+outgoing widget and reset a 250ms selection debounce. Do not show or fetch
+details for the new node until it remains selected for the full debounce period.
+
+After the debounce, show a cached widget if one exists; otherwise create its
+widget and fetch the node object for updated metadata and tags. A response
+updates only the widget for its own node, which is visible only while that node
+is selected. Inactive detail widgets remain hidden and are unmounted after a
+last-access TTL. A full DAG rebuild invalidates the detail widgets and restarts
+this process for the current selection.
 
 ### Container/Item Picker Modal
 
@@ -278,6 +306,32 @@ Edit should pre-populate the fields with the current values.
 
 Treat tags as a raw comma separated list in the UI for now. We will improve that editing in a future version. The backend stores tags as first class API objects, so some implementation work will be needed to be to correctly compose and decompose this list, creating new tags as necessary.
 
+Tags are kept in an in-memory index keyed by normalized name. Fetch all tags at
+startup and on F5, then use the index for autocomplete and resolving the
+comma-separated names to tag IDs. When a new tag is created, add it to the
+index immediately.
+
+Normalize each tag as the user types or pastes it: normalize text to Unicode NFC,
+apply `str.lower()`, preserve Unicode letters and numbers, and replace each run
+of whitespace, punctuation, symbols, or other separators with one hyphen. Strip
+leading and trailing hyphens. This supports Latin alphabets and also preserves
+other scripts natively; for example, `Électronique & Outils` becomes
+`électronique-outils`, and `工具 箱` becomes `工具-箱`. Ignore empty
+comma-separated entries, reject a non-empty entry that normalizes to an empty
+tag, and deduplicate normalized tags.
+
+While Create or Edit is submitting, disable Cancel and Submit until tag resolution,
+the API request, and the authoritative DAG refresh finish. After a successful
+Create, refresh the DAG and select the returned node. After a successful Edit,
+refresh the DAG and reselect the edited node, expanding its new ancestors when
+its parent changed.
+
+On a tag or API error, keep the modal and its draft open behind a Message Modal
+so the user can correct it. If the mutation succeeds but the refresh fails,
+dismiss the modal and show: "Saved, but could not refresh the inventory. Press
+F5 to reload." Do not retry automatically, as retrying Create could duplicate
+the new node.
+
 ### Confirmation Modal
 
 ```
@@ -322,6 +376,13 @@ The configuration modal is just a list of text input boxes with OK at the end, s
 When Token is provided, Username and Password should be disabled, and `*disabled*` should be displayed instead of the set value. The set value, if any, should be retained in case the user removes the Token.
 
 Configuration should be stored in `~/.config` or whatever the OS appropriate location is. If textual has a standard config support, use that. If necessary, use `platformdirs` to find the correct config location. We are only supporting a single configuration in V1, but the config file should plan to support multiple configurations in the future. The current configuration should be stored as `default` for now.
+
+V1 stores credentials in the TOML configuration file rather than integrating
+with the OS keyring. On POSIX, the config directory must be `0700` and the
+configuration file `0600`; correct these modes when loading or saving. Write
+updates atomically. Password input must be masked, and credential values must
+never appear in logs, errors, or diagnostic output. Keyring integration is a
+future enhancement.
 
 After an update the DAG should be reloaded. This will surface standard error messages if the user has misconfigured anything.
 

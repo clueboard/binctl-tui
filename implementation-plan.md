@@ -39,6 +39,11 @@ binctl_tui/
 | User config (URL, credentials) | TOML | `platformdirs.user_config_dir("binctl-tui") / config.toml` |
 
 Config file structure supports multiple named profiles for future use; V1 reads/writes only `[profiles.default]`.
+V1 stores credentials in this TOML file rather than integrating with the OS
+keyring. On POSIX, create and enforce `0700` permissions on the config directory
+and `0600` on `config.toml`. Save atomically so a partial write cannot expose or
+corrupt credentials. Never include credential values in logs, errors, or
+diagnostic output.
 
 No other state is persisted to disk. The DAG, expansion state, and search index are rebuilt from the API on each startup.
 
@@ -51,7 +56,9 @@ No other state is persisted to disk. The DAG, expansion state, and search index 
 | Bearer token | `app.py` app instance | Never written to disk when obtained via username+password login |
 | Server config (orphan location) | `app.py` app instance | Fetched once at startup, refreshed on F5 |
 | DAG + search index | `InventoryCache` (cache.py) | Rebuilt from API on startup and after any mutating operation |
+| Tag index | `app.py` app instance (`dict[str, Tag]`) | Normalized tag name → tag; loaded at startup and used for autocomplete and tag-ID resolution |
 | Tree expansion state | `app.py` app instance (`dict[str, bool]`) | Preserved across DAG rebuilds so the UI doesn't jolt |
+| Node detail widgets | `MainScreen` widget cache (`dict[str, NodeDetailWidget]`) | Created lazily after selection settles; hidden when inactive and unmounted after a last-access TTL |
 | Active operations counter | `MainScreen` reactive | Drives `LoadingIndicator` visibility |
 
 
@@ -66,50 +73,61 @@ No other state is persisted to disk. The DAG, expansion state, and search index 
 - Store as TOML: `config.toml` with `[profiles.default]` section (future-proof for multiple profiles)
 - Fields per profile: `url`, `token`, `username`, `password`
 - Functions: `load_config(profile="default")`, `save_config(data, profile="default")`
+- On POSIX, create and enforce `0700` for the config directory and `0600` for the file; `save_config()` writes atomically
 
-## Phase 3: Async Service Layer (`service.py`)
+## Phase 3: Service Layer (`service.py`)
 
-Wraps binctl-client API functions. Network calls are always async; never block the main thread.
+Wraps binctl-client API functions. All API operations after client construction use
+the generated client's async functions and never block the main thread.
+
+Authentication during `build_client()` is intentionally synchronous when the user
+provides a username and password: `binctl-client` obtains the bearer token while
+constructing its `Client`. This may briefly block during startup or after a
+configuration change, which is acceptable for V1 and avoids duplicating the
+client's authentication implementation.
 
 - Handles **pagination** for `get_nodes_list` (loop until `offset + len(items) >= total`)
-- Handles **auth**: if token provided use directly; else call login endpoint to get bearer token; on error surface to caller
-- Async functions:
+- Handles **auth**: if token provided use directly; otherwise construct the client with username/password so it synchronously obtains a bearer token; surface errors to caller
+- Functions:
   - `build_client(config)` → authenticated `Client`
-  - `fetch_all_nodes(client)` → paginated `list[Node]`
+  - `fetch_all_nodes(client)` → paginated `list[NodeChild]` summaries
   - `fetch_node(client, node_id)` → single `Node` with full detail (metadata + tags)
+  - `fetch_all_tags(client)` → paginated `list[Tag]`
   - `fetch_server_config(client)` → `ServerConfig` (orphan location)
   - `create_node(client, data: NodeCreate)` → `Node`
   - `update_node(client, node_id, data: NodeUpdate)` → `Node`
   - `delete_node(client, node_id)` → deleted ids
-  - `get_or_create_tag(client, label)` → `Tag`
+  - `get_or_create_tag(client, tag_index, name)` → `Tag`, adding newly created tags to the index
 
 ## Phase 4: DAG Cache (`cache.py`)
 
 `InventoryCache` class (justified: long-lived mutable state).
 
 ```
-nodes:        dict[str, Node]         # id → Node
+nodes:        dict[str, NodeChild]    # id → paginated node-list summary
 children:     dict[str, list[str]]    # parent_id → [child_ids]
 roots:        list[str]               # ids of nodes with no parent
 search_index: list[tuple[str, str]]   # (path_string, node_id) — pre-built flat index
 ```
 
 Methods:
-- `build(nodes: list[Node])` — populate all structures from a flat node list
-- `get_node(id)` → `Node`
-- `get_children(id)` → `list[Node]`
-- `get_path(id)` → `list[Node]` (root → node)
+- `build(nodes: list[NodeChild])` — populate all structures from a flat node-list response
+- `get_node(id)` → `NodeChild`
+- `get_children(id)` → `list[NodeChild]`
+- `get_path(id)` → `list[NodeChild]` (root → node)
 - `get_path_string(id)` → `"Home / Office / Bookshelf 2"`
 - `search(query)` → `list[tuple[str, str]]` — case-insensitive substring, returns (path_string, node_id)
 
-The search index is pre-built on `build()` so search is O(n) scan with no per-query tree traversal.
+The cache stores only `NodeChild` summaries from `fetch_all_nodes()`; it never
+eagerly fetches full `Node` objects. The search index is pre-built on `build()`
+so search is O(n) scan with no per-query tree traversal.
 
 ## Phase 5: Main Screen (`screens/main.py`)
 
 Layout via Textual CSS — a horizontal 25/75 split:
 
 - **Left pane (25%):** A self-contained box with a header `Static` and a `Tree` below it — the Containers sidebar; always has focus even when visually hidden
-- **Right pane (75%):** A single container with a shared header `Static` (showing the selected node title), inside which the space is split left/right:
+- **Right pane (75%):** A detail-widget host with a shared header `Static` (showing the selected node title). The visible node detail widget is split left/right:
   - **Left half:** `ListView` (focusable=False) — node metadata (label, created, modified, tags)
   - **Right half:** `Markdown` — node description
 
@@ -122,7 +140,11 @@ Sidebar hide/show:
 - Toggle CSS class `.hidden` on the sidebar widget (never `display = False`)
 - CSS handles `width: 0; overflow: hidden` with a 150ms transition
 
-On cursor move: re-fetch node detail from API (`fetch_node`), update metadata and description panes.
+Detail widgets:
+- Key widgets by node ID. On selection change, hide the outgoing widget and reset a 250ms selection debounce.
+- Only after the selected node remains unchanged for the full debounce period, show its cached widget or create it and fetch its full `Node` detail from the API (`fetch_node`). This is the only place full nodes are fetched.
+- A detail response updates only the widget keyed by its node ID. It is shown only when that node remains selected, so late responses populate their own hidden widget instead of replacing the current display.
+- Keep inactive widgets hidden and unmount them after a last-access TTL. Rebuilding the DAG invalidates detail widgets and restarts the debounce for the current selection.
 
 ## Phase 6: Keybindings
 
@@ -139,7 +161,7 @@ On cursor move: re-fetch node detail from API (`fetch_node`), update metadata an
 | ^C        | Quit                    | Works even in modals                                                  |
 | F1        | Help                    | Works in modals; push HelpScreen                                      |
 | F2        | Config                  | Works in modals; dismiss current modal first (may lose work)          |
-| F5        | Refresh                 | Re-fetch DAG from server                                              |
+| F5        | Refresh                 | Re-fetch DAG and tag index from server                                |
 | Enter     | Select / Submit         | In modal: acts on focused widget, not left pane                       |
 | Up / Down | Cursor Navigation       | In modal: acts on focused widget                                      |
 | PgUp/PgDn | Scroll Description      | Scrolls the description `Markdown` widget                             |
@@ -170,8 +192,15 @@ Used for both **[N] New** and **[E] Edit**.
 - Cancel / Submit buttons
 - Parent defaults to: selected container, or parent of selected item
 - Clicking Parent field opens PickerModal (containers only, with `<No Parent>`)
-- On submit: split tags by comma, call `get_or_create_tag()` for each, send tag ids to API
-- API 4xx errors: show MessageModal; keep NodeEditModal open so the user can correct
+- Tags autocomplete from the in-memory tag index and are normalized as the user types or pastes:
+  1. Normalize Unicode text to NFC.
+  2. Convert letters to lowercase with `str.lower()`.
+  3. Preserve Unicode letters and numbers; turn every run of whitespace, punctuation, symbols, and other separators into one hyphen.
+  4. Strip leading and trailing hyphens.
+  5. Ignore empty comma-separated entries; reject a non-empty entry that normalizes to an empty tag; deduplicate normalized tags.
+- On submit: resolve normalized names through the tag index, call `get_or_create_tag()` only for missing names, send the resulting tag IDs to the API, then use the shared mutation lifecycle below
+- Disable Cancel and Submit while tag resolution, the create/update request, and its refresh are in progress
+- API or tag-resolution errors: show MessageModal; keep NodeEditModal open with its draft intact so the user can correct it
 
 ### ConfirmModal (`confirm.py`)
 - Message area (grows to fit), Cancel (left) / Ok (right)
@@ -184,9 +213,10 @@ Used for both **[N] New** and **[E] Edit**.
 
 ### ConfigModal (`settings.py`)
 - Inputs: URL, Token, Username, Password
+- Password uses masked input
 - When Token field has a value: Username and Password are disabled and show `*disabled*`; their stored values are retained
-- On submit: `save_config()`, rebuild API client, reload DAG
-- Reloading DAG after config update will surface auth/connection errors naturally
+- On submit: `save_config()`, rebuild API client, reload the DAG and tag index
+- Reloading after config update will surface auth/connection errors naturally
 
 ## Phase 8: Help Screen (`screens/help.py`)
 
@@ -200,32 +230,53 @@ Used for both **[N] New** and **[E] Edit**.
 2. If no config file exists → open ConfigModal immediately
 3. Build API client (`build_client(config)`)
    - If token provided: use directly
-   - If username+password: call login endpoint to get bearer token (stored in memory only, not persisted)
+   - If username+password: synchronously obtain a bearer token during client construction; it is stored in memory only, not persisted
 4. Fetch `ServerConfig` (orphan location)
    - On error (auth failure, connection error): show dialog with "Exit" / "Configuration" choices
-5. Increment `active_operations`, fetch all nodes (paginated), decrement on complete
-6. Build `InventoryCache` from fetched nodes
+5. Increment `active_operations`, fetch all nodes and tags (paginated), decrement on complete
+6. Build `InventoryCache` from node summaries and the normalized tag index separately from tags
 7. Populate Tree from `cache.roots`
 
 ## Phase 10: Node Operations
 
+### Shared Mutation Lifecycle
+Used by Create, Edit, and Move.
+
+1. Disable the initiating modal's controls as applicable and increment `active_operations` once for the complete operation.
+2. Perform the API mutation, retaining the returned node ID.
+3. Re-fetch the full `NodeChild` summary DAG and rebuild `InventoryCache`; do not patch the cache from the full `Node` mutation response.
+4. Restore expansion state, expand the target's ancestors as needed, rebuild the tree, and select the target node.
+5. On successful refresh, dismiss the initiating modal. The selected node's 250ms detail debounce then loads its full detail widget.
+6. On a tag-resolution or API error, preserve the old cache and keep NodeEditModal's draft open. Show MessageModal so the user can correct the error.
+7. If the API mutation succeeds but the DAG refresh fails, dismiss NodeEditModal and show MessageModal: "Saved, but could not refresh the inventory. Press F5 to reload." Keep the old cache visible; do not offer a retry that could duplicate a Create.
+8. Decrement `active_operations` and re-enable controls in `finally`.
+
+### Create
+1. Submit NodeEditModal using `create_node`.
+2. Use the returned node ID as the shared lifecycle target so the newly created node is selected after the DAG refresh.
+
+### Edit
+1. Submit NodeEditModal using `update_node`.
+2. Use the original node ID as the shared lifecycle target, including if its parent changed.
+
 ### Move
 1. Open PickerModal (containers only, `<No Parent>` as first option)
-2. On selection: increment `active_operations`
-3. Note currently selected node id
-4. Call `update_node` with new `parent_id`
-5. Re-fetch full DAG, rebuild cache
-6. Restore previous expansion state; move cursor to the moved node (expanding ancestors as needed)
-7. Decrement `active_operations`
+2. On selection: call `update_node` with the new `parent_id`, using the selected node ID as the shared lifecycle target
 
 ### Delete Item
-1. Show ConfirmModal: "Delete `<label>`? This cannot be undone."
-2. On confirm: `delete_node`, refresh tree
+1. Before confirmation, capture the selected node's direct previous sibling ID and parent ID from `InventoryCache`. If the selected node is the first root, also capture its next root ID.
+2. Show ConfirmModal: "Delete `<label>`? This cannot be undone."
+3. On confirm, increment `active_operations`, call `delete_node`, and re-fetch the full `NodeChild` summary DAG.
+4. Rebuild `InventoryCache` and restore expansion state.
+5. Select the captured previous sibling if it remains in the refreshed cache; otherwise select the captured parent. When deleting the first root, select its captured next root if it remains instead. If no fallback remains, leave the tree unselected.
+6. On an API or refresh error, keep the old cache and tree visible and show MessageModal.
+7. Decrement `active_operations` in `finally`.
 
 ### Delete Container
 1. Fetch server config for orphan location
-2. Show ConfirmModal: "Delete `<label>`? Any items inside will be moved to `<orphan_location or 'root'>`."
-3. On confirm: `delete_node`, refresh tree
+2. Before confirmation, capture the selected node's direct previous sibling ID and parent ID from `InventoryCache`. If the selected node is the first root, also capture its next root ID.
+3. Show ConfirmModal: "Delete `<label>`? Any items inside will be moved to `<orphan_location or 'root'>`."
+4. On confirm, use the Delete Item lifecycle above.
 
 ## Phase 11: Thread Safety
 
