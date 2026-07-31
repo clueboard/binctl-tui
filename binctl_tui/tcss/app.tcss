@@ -1,0 +1,102 @@
+Screen {
+    layout: vertical;
+}
+
+ModalScreen {
+    align: center middle;
+}
+
+#main-screen, #workspace, #detail-pane, #detail-host {
+    height: 1fr;
+}
+
+#workspace {
+    width: 100%;
+}
+
+#sidebar {
+    width: 25%;
+    border: tall $primary;
+}
+
+#sidebar.hidden {
+    width: 0;
+    border: none;
+    padding: 0;
+    margin: 0;
+    overflow: hidden hidden;
+}
+
+#detail-pane {
+    width: 1fr;
+    border: tall $primary;
+}
+
+.pane-header {
+    height: 1;
+    padding: 0 1;
+    background: $primary;
+    color: $text;
+}
+
+#loading {
+    width: 3;
+    display: none;
+}
+
+.node-detail {
+    height: 1fr;
+}
+
+.metadata, .description {
+    width: 50%;
+    height: 1fr;
+    padding: 1;
+}
+
+.modal-body {
+    width: 70;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    border: tall $primary;
+    background: $surface;
+}
+
+.modal-title {
+    text-align: center;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.modal-message {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.modal-buttons {
+    height: auto;
+    margin-top: 1;
+    align-horizontal: right;
+}
+
+.modal-buttons Button {
+    margin-left: 1;
+}
+
+.picker {
+    height: 70%;
+}
+
+.picker OptionList {
+    height: 1fr;
+}
+
+.node-edit TextArea {
+    height: 8;
+    max-height: 16;
+}
+
+.settings #token-fields, .settings #password-fields {
+    height: auto;
+}

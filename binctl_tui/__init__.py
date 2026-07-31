@@ -1,0 +1,2 @@
+"""Textual frontend for binctl."""
+
