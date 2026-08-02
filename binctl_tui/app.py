@@ -63,10 +63,12 @@ class BinctlApp(App[None]):
         Binding("pagedown", "scroll_description_down", "Description", show=False),
     ]
 
-    active_operations = reactive(0)
+    active_operations = reactive(0, repaint=False)
+    loading_operations = reactive(0, repaint=False)
 
     def __init__(self) -> None:
         super().__init__()
+        self.theme = "textual-light"
         self.client: Client | None = None
         self.server_config: ServerConfig | None = None
         self.cache = InventoryCache()
@@ -79,6 +81,7 @@ class BinctlApp(App[None]):
 
     def on_mount(self) -> None:
         settings = config.load_config()
+        self.theme = self._configured_theme(settings)
 
         if not settings:
             self.push_screen(ConfigModal(settings), self._initial_configuration_saved)
@@ -86,16 +89,20 @@ class BinctlApp(App[None]):
 
         self.run_worker(self._initialize(), group="startup", exclusive=True)
 
-    def watch_active_operations(self, count: int) -> None:
+    def watch_loading_operations(self, count: int) -> None:
         if self.is_mounted:
             self.query_one(MainScreen).set_loading(count > 0)
 
     @asynccontextmanager
-    async def operation(self) -> AsyncIterator[None]:
+    async def operation(self, *, show_loading: bool = True) -> AsyncIterator[None]:
         self.active_operations += 1
+        if show_loading:
+            self.loading_operations += 1
         try:
             yield
         finally:
+            if show_loading:
+                self.loading_operations -= 1
             self.active_operations -= 1
 
     async def _initialize(self) -> None:
@@ -138,7 +145,7 @@ class BinctlApp(App[None]):
     async def load_node_detail(self, node_id: str) -> Node:
         if self.client is None:
             raise RuntimeError("The API client has not been configured")
-        async with self.operation():
+        async with self.operation(show_loading=False):
             node = await fetch_node(self.client, node_id)
 
         return node
@@ -161,6 +168,8 @@ class BinctlApp(App[None]):
             self.show_message(f"Could not refresh inventory: {error}")
 
     def action_help(self) -> None:
+        if isinstance(self.screen, HelpScreen):
+            return
         self.push_screen(HelpScreen())
 
     def action_configuration(self) -> None:
@@ -182,6 +191,7 @@ class BinctlApp(App[None]):
     async def _apply_configuration(self, values: dict[str, str]) -> None:
         try:
             config.save_config(values)
+            self.theme = self._configured_theme(values)
             self.client = build_client(config.CONFIG)
             async with self.operation():
                 self.server_config = await fetch_server_config(self.client)
@@ -243,14 +253,14 @@ class BinctlApp(App[None]):
             "description": description,
         }
         self.push_screen(
-            NodeEditModal(self.cache, title="Edit Node", initial=initial),
+            NodeEditModal(self.cache, title="Edit Node", initial=initial, node_id=node_id),
         )
 
     def submit_node_draft(self, modal: NodeEditModal, draft: NodeDraft) -> None:
         selected_id = self.query_one(MainScreen).selected_id
         modal.set_busy(True)
         self.run_worker(
-            self._save_node_draft(modal, draft, selected_id),
+            self._save_node_draft(modal, draft, modal.node_id, selected_id),
             group="node-save",
             exclusive=True,
         )
@@ -260,6 +270,7 @@ class BinctlApp(App[None]):
         modal: NodeEditModal,
         draft: NodeDraft,
         node_id: str | None,
+        selected_id: str | None,
     ) -> None:
         mutation_succeeded = False
         refresh_succeeded = False
@@ -272,7 +283,7 @@ class BinctlApp(App[None]):
                     for name in draft["tag_names"]
                 ]
                 if node_id is None:
-                    saved = await create_node(
+                    await create_node(
                         self.client,
                         NodeCreate(
                             label=draft["label"],
@@ -283,7 +294,7 @@ class BinctlApp(App[None]):
                         ),
                     )
                 else:
-                    saved = await update_node(
+                    await update_node(
                         self.client,
                         node_id,
                         NodeUpdate(
@@ -295,7 +306,7 @@ class BinctlApp(App[None]):
                         ),
                     )
                 mutation_succeeded = True
-            await self.refresh_inventory(saved.id)
+            await self.refresh_inventory(selected_id)
             refresh_succeeded = True
         except Exception as error:
             if mutation_succeeded:
@@ -459,6 +470,10 @@ class BinctlApp(App[None]):
 
         return node.parent_id if isinstance(node.parent_id, str) else None
 
+    def _configured_theme(self, values: dict[str, str]) -> str:
+        theme = values.get("theme", "textual-light")
+        return theme if theme in self.available_themes else "textual-light"
+
     def _select_with_ancestors(self, node_id: str) -> None:
         path = self.cache.get_path(node_id)
         for ancestor in path[:-1]:
@@ -466,7 +481,7 @@ class BinctlApp(App[None]):
                 self.expansion[ancestor.id] = True
         screen = self.query_one(MainScreen)
         screen._build_tree(self.expansion)
-        screen.select_node(node_id)
+        screen.call_after_refresh(screen.select_node, node_id)
 
     def _delete_fallback(self, node_id: str) -> str | None:
         node = self.cache.get_node(node_id)

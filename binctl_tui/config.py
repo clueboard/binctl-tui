@@ -43,7 +43,7 @@ def _secure_file(path: Path) -> None:
 
 def _clean_profile(raw_profile: object) -> dict[str, str]:
     profile = raw_profile if isinstance(raw_profile, dict) else {}
-    fields = ("url", "token", "username", "password")
+    fields = ("url", "token", "username", "password", "theme")
     cleaned = {
         field: value
         for field in fields
@@ -113,4 +113,3 @@ def save_config(data: dict[str, str], profile: str = "default") -> dict[str, str
     CONFIG = dict(cleaned)
 
     return dict(CONFIG)
-

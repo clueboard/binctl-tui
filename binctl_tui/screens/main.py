@@ -8,6 +8,7 @@ from binctl_client.models.node import Node
 from binctl_client.types import Unset
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.events import Key
 from textual.timer import Timer
 from textual.widgets import Footer, LoadingIndicator, Markdown, Static, Tree
 
@@ -24,7 +25,11 @@ class NodeDetailWidget(Horizontal):
 
     def compose(self) -> ComposeResult:
         yield Static("", id=f"metadata-{self.node_id}", classes="metadata")
-        yield Markdown("", id=f"description-{self.node_id}", classes="description")
+        yield Vertical(
+            Static("Description", classes="detail-section-title"),
+            Markdown("", id=f"description-{self.node_id}", classes="description-content"),
+            classes="description",
+        )
 
     def update_node(self, node: Node) -> None:
         tags = [] if isinstance(node.tags, Unset) else [tag.name for tag in node.tags]
@@ -38,7 +43,9 @@ class NodeDetailWidget(Horizontal):
         )
         description = "" if isinstance(node.description, Unset) else node.description or ""
         self.query_one(f"#metadata-{self.node_id}", Static).update(metadata)
-        self.query_one(f"#description-{self.node_id}", Markdown).update(description)
+        self.query_one(f"#description-{self.node_id}", Markdown).update(
+            description.replace("\n", "  \n"),
+        )
 
 
 class MainScreen(Vertical):
@@ -53,24 +60,28 @@ class MainScreen(Vertical):
         self.detail_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
+        inventory = Tree("", id="inventory", data=None)
         yield Horizontal(
             Vertical(
-                Horizontal(
-                    LoadingIndicator(id="loading"),
-                    Static("Containers"),
-                    classes="pane-header",
-                ),
-                Tree("Containers", id="inventory", data=None),
+                LoadingIndicator(id="loading"),
+                inventory,
                 id="sidebar",
             ),
             Vertical(
-                Static("Select an item", id="detail-title", classes="pane-header"),
+                Static("", id="detail-title", classes="pane-header"),
                 Vertical(id="detail-host"),
                 id="detail-pane",
             ),
             id="workspace",
         )
         yield Footer()
+
+    def on_mount(self) -> None:
+        inventory = self.query_one("#inventory", Tree)
+        inventory.show_root = False
+        inventory.show_guides = False
+        inventory.auto_expand = False
+        inventory.unselect()
 
     def set_cache(
         self,
@@ -84,7 +95,9 @@ class MainScreen(Vertical):
             detail.remove()
         self.details = {}
         self._build_tree(expansion)
-        self.select_node(selected_id)
+        if selected_id not in self.tree_nodes:
+            selected_id = min(self.cache.roots, key=self._tree_sort_key) if self.cache.roots else None
+        self.call_after_refresh(self.select_node, selected_id)
 
     def set_loading(self, is_loading: bool) -> None:
         self.query_one("#loading", LoadingIndicator).display = is_loading
@@ -113,15 +126,41 @@ class MainScreen(Vertical):
             else:
                 tree_node.expand()  # type: ignore[union-attr]
 
+    def on_key(self, event: Key) -> None:
+        if event.key not in {"left", "right", "shift+left", "shift+right"}:
+            return
+
+        tree = self.query_one("#inventory", Tree)
+        if tree.has_focus and event.key in {"shift+left", "shift+right"}:
+            if event.key == "shift+left":
+                tree.action_scroll_left()
+            else:
+                tree.action_scroll_right()
+            event.prevent_default()
+            event.stop()
+            return
+
+        tree_node = tree.cursor_node
+        node_id = tree_node.data if tree_node is not None else None
+        if not tree.has_focus or not isinstance(node_id, str):
+            return
+        if not self.cache.get_node(node_id).is_container:
+            return
+
+        if event.key == "left":
+            tree_node.collapse()
+        else:
+            tree_node.expand()
+        event.prevent_default()
+        event.stop()
+
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
         node_id = event.node.data
-        if isinstance(node_id, str):
-            self._schedule_detail(node_id)
+        self._schedule_detail(node_id if isinstance(node_id, str) else None)
 
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         node_id = event.node.data
-        if isinstance(node_id, str):
-            self._schedule_detail(node_id)
+        self._schedule_detail(node_id if isinstance(node_id, str) else None)
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
         node_id = event.node.data
@@ -138,7 +177,7 @@ class MainScreen(Vertical):
         tree.clear()
         tree.root.expand()
 
-        for root_id in self.cache.roots:
+        for root_id in sorted(self.cache.roots, key=self._tree_sort_key):
             self._add_tree_node(tree.root, root_id, expansion)
 
     def _add_tree_node(self, parent: object, node_id: str, expansion: dict[str, bool]) -> None:
@@ -147,13 +186,17 @@ class MainScreen(Vertical):
         tree_node = parent.add(
             node.label,
             data=node_id,
-            allow_expand=bool(children),
+            allow_expand=node.is_container,
             expand=expansion.get(node_id, False),
         )
         self.tree_nodes[node_id] = tree_node
 
-        for child in children:
+        for child in sorted(children, key=lambda child: self._tree_sort_key(child.id)):
             self._add_tree_node(tree_node, child.id, expansion)
+
+    def _tree_sort_key(self, node_id: str) -> tuple[str, str]:
+        node = self.cache.get_node(node_id)
+        return node.label.casefold(), node.id
 
     def _schedule_detail(self, node_id: str | None) -> None:
         if self.detail_timer is not None:
@@ -164,7 +207,7 @@ class MainScreen(Vertical):
         self.selected_id = node_id
 
         if node_id is None:
-            self.query_one("#detail-title", Static).update("Select an item")
+            self.query_one("#detail-title", Static).update("")
             return
 
         self.detail_timer = self.set_timer(0.25, lambda: self._show_detail(node_id))

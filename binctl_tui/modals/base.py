@@ -5,6 +5,7 @@ from __future__ import annotations
 from textual.binding import Binding
 from textual.events import Key
 from textual.screen import ModalScreen
+from textual.widgets import Select
 
 
 class BaseModal(ModalScreen[object | None]):
@@ -36,6 +37,11 @@ class BaseModal(ModalScreen[object | None]):
 
     def on_key(self, event: Key) -> None:
         """Use vertical arrows to traverse form controls without tabbing."""
+        if event.key in {"up", "down"} and any(
+            select.expanded for select in self.query(Select)
+        ):
+            return
+
         if event.key == "up":
             self.focus_previous()
         elif event.key == "down":

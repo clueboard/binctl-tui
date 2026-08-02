@@ -49,9 +49,19 @@ class PickerModal(BaseModal):
         if event.input.id == "query":
             self._update_results(event.value)
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Choose the highlighted result while focus remains in the filter."""
+        if event.input.id == "query":
+            self.query_one("#results", OptionList).action_select()
+            event.stop()
+
     def on_key(self, event: Key) -> None:
-        if event.key == "down":
-            self.query_one("#results", OptionList).action_cursor_down()
+        if event.key in {"up", "down"}:
+            results = self.query_one("#results", OptionList)
+            if event.key == "up":
+                results.action_cursor_up()
+            else:
+                results.action_cursor_down()
             event.prevent_default()
             event.stop()
             return

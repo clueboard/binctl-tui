@@ -16,7 +16,16 @@ ModalScreen {
 
 #sidebar {
     width: 25%;
-    border: tall $primary;
+    border: solid $primary;
+    background: $background;
+}
+
+#inventory {
+    background: $background;
+}
+
+#inventory:focus {
+    background-tint: transparent;
 }
 
 #sidebar.hidden {
@@ -29,7 +38,7 @@ ModalScreen {
 
 #detail-pane {
     width: 1fr;
-    border: tall $primary;
+    border: solid $primary;
 }
 
 .pane-header {
@@ -52,6 +61,15 @@ ModalScreen {
     width: 50%;
     height: 1fr;
     padding: 1;
+}
+
+.detail-section-title {
+    height: 1;
+    text-style: bold;
+}
+
+.description-content {
+    height: 1fr;
 }
 
 .modal-body {
@@ -85,16 +103,22 @@ ModalScreen {
 }
 
 .picker {
-    height: 70%;
+    height: auto;
+    max-height: 70%;
 }
 
 .picker OptionList {
-    height: 1fr;
+    height: auto;
+    max-height: 20;
 }
 
 .node-edit TextArea {
     height: 8;
     max-height: 16;
+}
+
+.node-edit Select {
+    width: 100%;
 }
 
 .settings #token-fields, .settings #password-fields {
